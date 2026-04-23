@@ -110,3 +110,4 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 server.listen(port, () => console.log(`[Signaling Server] Rodando na porta ${port}`));
+
