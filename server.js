@@ -1,19 +1,27 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const cors = require('cors');
 const http = require('http');
 const WebSocket = require('ws');
 
 const app = express();
 const port = process.env.PORT || 10000;
 
-app.use(cors());
+// Middleware de CORS manual (para evitar depender do pacote 'cors')
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
+
 app.use(bodyParser.json());
 
 // Gerenciamento de salas
 const rooms = {};
 
-// Helper: Gera código aleatório
 function generateCode() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
@@ -25,7 +33,6 @@ function getClientIp(req) {
     return ip;
 }
 
-// ── Rota: Criar Sala ─────────────────────────────────────────────────────────
 app.post('/create_room', (req, res) => {
     const host_ip = getClientIp(req);
     const host_port = parseInt(req.body.host_port) || 9999;
@@ -46,7 +53,6 @@ app.post('/create_room', (req, res) => {
         players: [host_ip],
         gameStarted: false,
         createdAt: Date.now(),
-        // Relay state
         host_ws: null,
         client_ws: null
     };
@@ -55,7 +61,6 @@ app.post('/create_room', (req, res) => {
     res.json({ code, settings: rooms[code].settings });
 });
 
-// ── Rota: Entrar na Sala ──────────────────────────────────────────────────────
 app.get('/join_room/:code', (req, res) => {
     const code = req.params.code.toUpperCase().trim();
     const playerIp = getClientIp(req);
@@ -86,44 +91,49 @@ app.delete('/room/:code', (req, res) => {
     } else res.status(404).json({ error: 'Não encontrado' });
 });
 
-// ── WebSocket Relay (O SEGREDO DO SUCESSO) ──────────────────────────────────
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/relay' });
 
 wss.on('connection', (ws, req) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const code = url.searchParams.get('room');
-    const role = url.searchParams.get('role'); // 'host' ou 'client'
+    try {
+        const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        const code = url.searchParams.get('room');
+        const role = url.searchParams.get('role');
 
-    if (!code || !rooms[code]) {
-        ws.close(1008, "Sala invalida");
-        return;
-    }
-
-    const room = rooms[code];
-
-    if (role === 'host') {
-        if (room.host_ws) room.host_ws.close();
-        room.host_ws = ws;
-        console.log(`[Relay] Host conectado na sala ${code}`);
-    } else {
-        if (room.client_ws) room.client_ws.close();
-        room.client_ws = ws;
-        console.log(`[Relay] Cliente conectado na sala ${code}`);
-    }
-
-    // Pipe de dados
-    ws.on('message', (data) => {
-        const target = (role === 'host') ? room.client_ws : room.host_ws;
-        if (target && target.readyState === WebSocket.OPEN) {
-            target.send(data);
+        if (!code || !rooms[code]) {
+            ws.close(1008, "Sala invalida");
+            return;
         }
-    });
 
-    ws.on('close', () => {
-        if (role === 'host') room.host_ws = null;
-        else room.client_ws = null;
-    });
+        const room = rooms[code];
+        if (role === 'host') {
+            if (room.host_ws) room.host_ws.close();
+            room.host_ws = ws;
+            console.log(`[Relay] Host conectado: ${code}`);
+        } else {
+            if (room.client_ws) room.client_ws.close();
+            room.client_ws = ws;
+            console.log(`[Relay] Cliente conectado: ${code}`);
+        }
+
+        ws.on('message', (data) => {
+            const target = (role === 'host') ? room.client_ws : room.host_ws;
+            if (target && target.readyState === WebSocket.OPEN) {
+                target.send(data);
+            }
+        });
+
+        ws.on('close', () => {
+            if (role === 'host') room.host_ws = null;
+            else room.client_ws = null;
+        });
+        
+        ws.on('error', (err) => console.error("[Relay Error]", err));
+
+    } catch (e) {
+        console.error("[Relay Connection Error]", e);
+        ws.close();
+    }
 });
 
 setInterval(() => {
