@@ -1,11 +1,16 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const app = express();
-const port = process.env.PORT || 3000;
+const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
 
+const app = express();
+const port = process.env.PORT || 10000;
+
+app.use(cors());
 app.use(bodyParser.json());
 
-// Gerenciamento de salas (em memória para este exemplo)
+// Gerenciamento de salas
 const rooms = {};
 
 // Helper: Gera código aleatório
@@ -13,18 +18,14 @@ function generateCode() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Helper: Extrai IP real (considerando proxies como Heroku/Render)
 function getClientIp(req) {
     const forwarded = req.headers['x-forwarded-for'];
     const ip = forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress;
-    // Normalizar IPv6 loopback para IPv4 se necessário
     if (ip === '::1') return '127.0.0.1';
     return ip;
 }
 
 // ── Rota: Criar Sala ─────────────────────────────────────────────────────────
-// POST /create_room
-// Body: { "host_port": 9999, "maxPlayers": 8, "settings": { "lives": 5, "timer": 60 } }
 app.post('/create_room', (req, res) => {
     const host_ip = getClientIp(req);
     const host_port = parseInt(req.body.host_port) || 9999;
@@ -44,40 +45,30 @@ app.post('/create_room', (req, res) => {
         settings,
         players: [host_ip],
         gameStarted: false,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        // Relay state
+        host_ws: null,
+        client_ws: null
     };
 
-    console.log(`[Sala Criada] Código: ${code} | Host: ${host_ip}:${host_port} | Max: ${maxPlayers}`);
+    console.log(`[Sala Criada] Código: ${code} | Host: ${host_ip}:${host_port}`);
     res.json({ code, settings: rooms[code].settings });
 });
 
 // ── Rota: Entrar na Sala ──────────────────────────────────────────────────────
-// GET /join_room/:code
 app.get('/join_room/:code', (req, res) => {
     const code = req.params.code.toUpperCase().trim();
     const playerIp = getClientIp(req);
     const room = rooms[code];
 
-    if (!room) {
-        return res.status(404).json({ error: 'Sala não encontrada' });
-    }
+    if (!room) return res.status(404).json({ error: 'Sala não encontrada' });
+    if (room.gameStarted) return res.status(403).json({ error: 'Jogo já iniciou' });
 
-    if (room.gameStarted) {
-        return res.status(403).json({ error: 'Jogo já iniciou' });
-    }
-
-    // Permitir se já estiver na sala
-    const isAlreadyIn = room.players.includes(playerIp);
-
-    if (!isAlreadyIn && room.players.length >= room.maxPlayers) {
-        return res.status(403).json({ error: 'Sala cheia' });
-    }
-
-    if (!isAlreadyIn) {
+    if (!room.players.includes(playerIp)) {
+        if (room.players.length >= room.maxPlayers) return res.status(403).json({ error: 'Sala cheia' });
         room.players.push(playerIp);
     }
 
-    console.log(`[Sala Entrou] Código: ${code} | Jogadores: ${room.players.length}/${room.maxPlayers}`);
     res.json({ 
         host_ip: room.host_ip,
         host_port: room.host_port,
@@ -87,30 +78,61 @@ app.get('/join_room/:code', (req, res) => {
     });
 });
 
-// ── Rota: Marcar partida iniciada ─────────────────────────────────────────────
-// DELETE /room/:code (ou POST /start_game/:code)
 app.delete('/room/:code', (req, res) => {
     const code = req.params.code.toUpperCase();
     if (rooms[code]) {
-        console.log(`[Sala Fechada] Código: ${code}`);
         delete rooms[code];
         res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Não encontrado' });
-    }
+    } else res.status(404).json({ error: 'Não encontrado' });
 });
 
-// Limpeza de salas antigas (> 2 horas)
+// ── WebSocket Relay (O SEGREDO DO SUCESSO) ──────────────────────────────────
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/relay' });
+
+wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const code = url.searchParams.get('room');
+    const role = url.searchParams.get('role'); // 'host' ou 'client'
+
+    if (!code || !rooms[code]) {
+        ws.close(1008, "Sala invalida");
+        return;
+    }
+
+    const room = rooms[code];
+
+    if (role === 'host') {
+        if (room.host_ws) room.host_ws.close();
+        room.host_ws = ws;
+        console.log(`[Relay] Host conectado na sala ${code}`);
+    } else {
+        if (room.client_ws) room.client_ws.close();
+        room.client_ws = ws;
+        console.log(`[Relay] Cliente conectado na sala ${code}`);
+    }
+
+    // Pipe de dados
+    ws.on('message', (data) => {
+        const target = (role === 'host') ? room.client_ws : room.host_ws;
+        if (target && target.readyState === WebSocket.OPEN) {
+            target.send(data);
+        }
+    });
+
+    ws.on('close', () => {
+        if (role === 'host') room.host_ws = null;
+        else room.client_ws = null;
+    });
+});
+
 setInterval(() => {
     const now = Date.now();
     for (const code in rooms) {
-        if (now - rooms[code].createdAt > 2 * 60 * 60 * 1000) {
-            delete rooms[code];
-        }
+        if (now - rooms[code].createdAt > 2 * 60 * 60 * 1000) delete rooms[code];
     }
 }, 30 * 60 * 1000);
 
-app.listen(port, () => {
-    console.log(`[Broker] Servidor rodando na porta ${port}`);
-    console.log(`[Broker] Rotas: POST /create_room | GET /join_room/:code | DELETE /room/:code`);
+server.listen(port, () => {
+    console.log(`[Broker+Relay] Servidor rodando na porta ${port}`);
 });
